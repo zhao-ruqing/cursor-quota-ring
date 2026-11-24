@@ -1,0 +1,22 @@
+{
+  "poll_seconds": 30,
+  "reposition_ms": 300,
+  "overlay_size": 44,
+  "activity_bar_width": 48,
+  "bottom_offset": 128,
+  "click_through": false,
+  "foreground_only": true,
+  "metric": "total",
+  "profiles": [
+    {
+      "id": "primary",
+      "label": "primary",
+      "user_data_dir": "%APPDATA%\\Cursor"
+    },
+    {
+      "id": "account2",
+      "label": "account2",
+      "user_data_dir": "%USERPROFILE%\\CursorAccount2\\data"
+    }
+  ]
+}
