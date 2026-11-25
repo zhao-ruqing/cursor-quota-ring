@@ -95,15 +95,19 @@ class App:
         self.root.title("cursor-quota-ring")
         self.root.protocol("WM_DELETE_WINDOW", self.shutdown)
 
+        bottom_offset = int(config.get("bottom_offset") or 80)
+        agents_bottom = config.get("agents_bottom_offset")
         self.overlays = OverlayManager(
             self.root,
             overlay_size=int(config.get("overlay_size") or 40),
             activity_bar_width=int(config.get("activity_bar_width") or 48),
-            bottom_offset=int(config.get("bottom_offset") or 80),
+            bottom_offset=bottom_offset,
+            agents_bottom_offset=None if agents_bottom is None else int(agents_bottom),
             click_through=bool(config.get("click_through", False)),
             metric=self.metric,
-            foreground_only=bool(config.get("foreground_only", False)),
+            foreground_only=bool(config.get("foreground_only", False)),  # false = always-on
         )
+        self.overlays.set_accounts([(p.normalized_dir(), p.label) for p in self.profiles])
 
     def start(self) -> None:
         if not self.profiles:

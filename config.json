@@ -4,8 +4,9 @@
   "overlay_size": 44,
   "activity_bar_width": 48,
   "bottom_offset": 128,
+  "agents_bottom_offset": 4,
   "click_through": false,
-  "foreground_only": true,
+  "foreground_only": false,
   "metric": "total",
   "profiles": [
     {

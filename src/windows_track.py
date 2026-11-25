@@ -36,6 +36,15 @@ user32.IsIconic.restype = wt.BOOL
 user32.GetDpiForWindow.argtypes = [wt.HWND]
 user32.GetDpiForWindow.restype = ctypes.c_uint
 user32.GetForegroundWindow.restype = wt.HWND
+user32.MonitorFromWindow.argtypes = [wt.HWND, wt.DWORD]
+user32.MonitorFromWindow.restype = wt.HMONITOR
+user32.GetAncestor.argtypes = [wt.HWND, wt.UINT]
+user32.GetAncestor.restype = wt.HWND
+user32.IsChild.argtypes = [wt.HWND, wt.HWND]
+user32.IsChild.restype = wt.BOOL
+
+MONITOR_DEFAULTTONEAREST = 2
+GA_ROOT = 2
 
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 TH32CS_SNAPPROCESS = 0x00000002
@@ -45,6 +54,11 @@ ProcessCommandLineInformation = 60
 _proc_cache: dict[int, tuple[str, int]] = {}
 _proc_cache_at = 0.0
 _PROC_CACHE_TTL = 8.0
+
+
+def is_agents_title(title: str) -> bool:
+    t = (title or "").lower()
+    return "agents" in t
 
 
 @dataclass(frozen=True)
@@ -62,6 +76,7 @@ class CursorWindow:
     client_width: int
     client_height: int
     dpi: int
+    is_agents: bool = False
 
     @property
     def visible_client(self) -> bool:
@@ -300,7 +315,8 @@ def _is_main_cursor_window(title: str) -> bool:
     if not title:
         return False
     t = title.lower()
-    skip = ("cursor agents", "devtools", "gpu", "crashpad", "msctfime", "default ime")
+    # Include editor + Agents windows; skip Chromium/IME chrome only.
+    skip = ("devtools", "gpu", "crashpad", "msctfime", "default ime")
     if any(s in t for s in skip):
         return False
     return "cursor" in t
@@ -349,12 +365,57 @@ def discover_cursor_windows() -> list[CursorWindow]:
                 client_width=int(client.right - client.left),
                 client_height=int(client.bottom - client.top),
                 dpi=dpi,
+                is_agents=is_agents_title(title),
             )
         )
         return True
 
     user32.EnumWindows(callback, 0)
     return found
+
+
+def monitor_id(hwnd: int) -> int:
+    """Stable handle id for the monitor containing hwnd (0 if unknown)."""
+    if not hwnd:
+        return 0
+    try:
+        return int(user32.MonitorFromWindow(wt.HWND(hwnd), MONITOR_DEFAULTTONEAREST) or 0)
+    except Exception:
+        return 0
+
+
+def foreground_hwnd() -> int:
+    return int(user32.GetForegroundWindow() or 0)
+
+
+def root_hwnd(hwnd: int) -> int:
+    if not hwnd:
+        return 0
+    try:
+        root = int(user32.GetAncestor(wt.HWND(hwnd), GA_ROOT) or 0)
+        return root or hwnd
+    except Exception:
+        return hwnd
+
+
+def window_owns_foreground(hwnd: int, fg: int | None = None) -> bool:
+    """True if fg is this top-level window or one of its descendants."""
+    if not hwnd:
+        return False
+    if fg is None:
+        fg = foreground_hwnd()
+    if not fg:
+        return False
+    if int(fg) == int(hwnd):
+        return True
+    if root_hwnd(fg) == int(hwnd):
+        return True
+    try:
+        if user32.IsChild(wt.HWND(hwnd), wt.HWND(fg)):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def foreground_cursor_hwnd() -> int | None:
@@ -365,18 +426,21 @@ def foreground_cursor_hwnd() -> int | None:
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     if not _is_cursor_pid(int(pid.value)):
         return None
-    if not _is_main_cursor_window(_window_title(hwnd)):
-        # Might be a child; walk up
-        cur = hwnd
-        for _ in range(8):
-            parent = int(user32.GetParent(cur) or 0)
-            if not parent:
-                owner = int(user32.GetWindow(cur, 4) or 0)  # GW_OWNER
-                parent = owner
-            if not parent or parent == cur:
-                break
-            cur = parent
-            if _is_main_cursor_window(_window_title(cur)):
-                return cur
-        return None
-    return hwnd
+    # Prefer the top-level frame (editor or Agents), not an inner Chromium child.
+    root = root_hwnd(hwnd)
+    if _is_main_cursor_window(_window_title(root)):
+        return root
+    if _is_main_cursor_window(_window_title(hwnd)):
+        return hwnd
+    cur = hwnd
+    for _ in range(8):
+        parent = int(user32.GetParent(cur) or 0)
+        if not parent:
+            owner = int(user32.GetWindow(cur, 4) or 0)  # GW_OWNER
+            parent = owner
+        if not parent or parent == cur:
+            break
+        cur = parent
+        if _is_main_cursor_window(_window_title(cur)):
+            return cur
+    return None

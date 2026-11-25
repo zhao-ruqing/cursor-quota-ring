@@ -24,8 +24,11 @@ if ($Hidden -and -not $Probe) {
     Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -and ($_.CommandLine -like "*$Root*main.py*" -or $_.CommandLine -like "*$Root*_boot.py*") } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Process -FilePath $exe -ArgumentList $argList -WorkingDirectory $Root -WindowStyle Hidden
+    $boot = Join-Path $Root "_boot.py"
+    $pyw = if ($pythonw) { $pythonw.Source } else { $exe }
+    Start-Process -FilePath $pyw -ArgumentList "`"$boot`"" -WorkingDirectory $Root -WindowStyle Hidden
     Write-Host "cursor-quota-ring started in background (no console)"
 } else {
     & $exe @argList
 }
+

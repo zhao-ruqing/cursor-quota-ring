@@ -6,7 +6,7 @@ from __future__ import annotations
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 
-def _color_for_pct(pct: float | None) -> tuple[int, int, int]:
+def color_for_pct(pct: float | None) -> tuple[int, int, int]:
     if pct is None:
         return (156, 163, 175)
     if pct >= 95:
@@ -16,6 +16,10 @@ def _color_for_pct(pct: float | None) -> tuple[int, int, int]:
     if pct >= 50:
         return (234, 179, 8)
     return (34, 197, 94)
+
+
+# Back-compat alias
+_color_for_pct = color_for_pct
 
 
 def render_ring_photo(
