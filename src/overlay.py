@@ -14,7 +14,6 @@ from .usage_api import UsageSnapshot
 from .windows_track import (
     CursorWindow,
     foreground_hwnd,
-    is_cursor_exposed,
     monitor_id,
     root_hwnd,
     window_owns_foreground,
@@ -251,49 +250,24 @@ class OverlayManager:
         title = (_window_title(root_hwnd(hwnd)) or _window_title(hwnd) or "").lower()
         return "cur-usage" in title or "cursor-quota-ring" in title
 
-    def _overlay_skip_hwnds(self) -> set[int]:
-        skip: set[int] = set()
-        for ov in self._overlays.values():
-            if ov.hwnd:
-                skip.add(ov.hwnd)
-        try:
-            if self._peek.visible and self._peek._win is not None:
-                peek_hwnd = int(
-                    user32_raw.GetParent(int(self._peek._win.winfo_id()))
-                    or self._peek._win.winfo_id()
-                )
-                if peek_hwnd:
-                    skip.add(peek_hwnd)
-        except Exception:
-            pass
-        return skip
-
     def _should_show_on(
         self,
         target: CursorWindow,
         fg: int,
         fg_is_cursor: bool,
         fg_is_ours: bool,
-        *,
-        skip_hwnds: set[int] | None = None,
     ) -> bool:
-        """Show on Cursor; hide when another app covers it (even if focus is elsewhere)."""
+        """Keep ring on Cursor across monitors; hide only when another app covers same screen."""
         if self.foreground_only:
             return bool(fg) and root_hwnd(fg) == target.hwnd
 
-        # Clicking our ring/peek must not hide the overlay.
-        if fg_is_ours:
+        if not fg:
+            return True
+        if fg_is_cursor or fg_is_ours:
             return True
 
-        # This Cursor frame has focus (or a child does) — always show.
-        # Needed because always-on-top widgets (weather, etc.) can sit above
-        # Cursor in z-order while Cursor still owns the foreground.
-        if fg_is_cursor and window_owns_foreground(target.hwnd, fg):
-            return True
-
-        # Focus is elsewhere: only show if Cursor is still the front app on
-        # its own monitor (dual-screen). If a browser/etc. covers it, hide.
-        return is_cursor_exposed(target.hwnd, skip_hwnds=skip_hwnds)
+        # Focus is a non-Cursor app: keep ring if that app is on another monitor.
+        return monitor_id(fg) != monitor_id(target.hwnd)
 
     @staticmethod
     def _same_screen_slot(a: CursorWindow, b: CursorWindow) -> bool:
@@ -374,14 +348,10 @@ class OverlayManager:
             hit = next((w for w in visible if w.hwnd == foreground_cursor), None)
             return [hit] if hit else []
 
-        skip_hwnds = self._overlay_skip_hwnds()
-
         # Group by monitor; keep EnumWindows order (= z-order, topmost first).
         by_mon: dict[int, list[CursorWindow]] = {}
         for w in visible:
-            if not self._should_show_on(
-                w, fg, fg_is_cursor, fg_is_ours, skip_hwnds=skip_hwnds
-            ):
+            if not self._should_show_on(w, fg, fg_is_cursor, fg_is_ours):
                 continue
             mon = monitor_id(w.hwnd) or self._slot_fallback(w)
             by_mon.setdefault(mon, []).append(w)
