@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 
@@ -64,14 +67,18 @@ def render_ring_photo(
     # Smaller + bold; nudge slightly above geometric center.
     font_size = max(8 * ss, big // 4 - (3 * ss if len(text) > 2 else 0))
     font = None
-    for name in (
-        "segoeuib.ttf",  # Segoe UI Bold
-        "SegoeUI-Bold.ttf",
-        "arialbd.ttf",
-        "segoeui.ttf",
-    ):
+    fonts_dir = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+    font_candidates = (
+        fonts_dir / "segoeuib.ttf",
+        fonts_dir / "arialbd.ttf",
+        fonts_dir / "segoeui.ttf",
+        Path("segoeuib.ttf"),
+        Path("arialbd.ttf"),
+        Path("segoeui.ttf"),
+    )
+    for path in font_candidates:
         try:
-            font = ImageFont.truetype(name, font_size)
+            font = ImageFont.truetype(str(path), font_size)
             break
         except OSError:
             continue

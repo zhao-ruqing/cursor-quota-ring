@@ -6,24 +6,26 @@ import json
 import os
 import sys
 import threading
-import tkinter as tk
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.accounts import load_profiles, read_auth  # noqa: E402
-from src.overlay import OverlayManager  # noqa: E402
-from src.usage_api import UsageSnapshot, fetch_usage  # noqa: E402
+# DPI awareness MUST be set before tkinter is imported (Windows locks it on load).
 from src.windows_track import (  # noqa: E402
     discover_cursor_windows,
     enable_dpi_awareness,
     foreground_cursor_hwnd,
 )
 
-# DPI awareness BEFORE Tk so ring is drawn in real pixels (sharp on 150%/200%).
 enable_dpi_awareness()
+
+import tkinter as tk  # noqa: E402
+
+from src.accounts import load_profiles, read_auth  # noqa: E402
+from src.overlay import OverlayManager  # noqa: E402
+from src.usage_api import UsageSnapshot, fetch_usage  # noqa: E402
 
 
 def load_config(path: Path) -> dict:
@@ -115,8 +117,11 @@ class App:
             return
         print(f"Loaded {len(self.profiles)} profile(s). Tracking Cursor windows...")
         print("Quit: Ctrl+C in this console.")
+        # First paint must already have usage — otherwise every restart shows a
+        # hollow ring ("-") and a missed redraw can leave it empty.
+        self._refresh_all_usage()
         threading.Thread(target=self._poll_loop, name="usage-poll", daemon=True).start()
-        self.root.after(200, self._tick)
+        self.root.after(50, self._tick)
         try:
             self.root.mainloop()
         except KeyboardInterrupt:
@@ -130,15 +135,60 @@ class App:
         except Exception:
             pass
 
-    def _poll_loop(self) -> None:
-        while not self._stop.is_set():
-            mapping: dict[str, UsageSnapshot] = {}
-            for p in self.profiles:
-                auth = read_auth(p)
-                snap = fetch_usage(auth)
-                mapping[p.normalized_dir()] = snap
+    def _poll_one(self, p) -> tuple[str, UsageSnapshot]:
+        try:
+            auth = read_auth(p)
+            snap = fetch_usage(auth)
+        except Exception as e:  # noqa: BLE001 — keep poll thread alive
+            snap = UsageSnapshot(
+                email="",
+                label=p.label,
+                plan="",
+                total_percent=None,
+                auto_percent=None,
+                api_percent=None,
+                display_message="",
+                error=f"poll exception: {e}",
+            )
+        return p.normalized_dir(), snap
+
+    def _publish(self, key: str, snap: UsageSnapshot) -> None:
+        with self._lock:
+            self.usage_by_dir = {**self.usage_by_dir, key: snap}
+        # Wake the UI promptly when a background poll lands new numbers.
+        try:
+            self.root.after(0, self.overlays.invalidate_render_cache)
+        except Exception:
+            pass
+
+    def _refresh_all_usage(self) -> None:
+        for p in self._profiles_poll_order():
+            key, snap = self._poll_one(p)
             with self._lock:
-                self.usage_by_dir = mapping
+                self.usage_by_dir = {**self.usage_by_dir, key: snap}
+
+    def _profiles_poll_order(self) -> list:
+        """Prefer accounts tied to currently visible Cursor windows."""
+        try:
+            wins = discover_cursor_windows()
+        except Exception:
+            return list(self.profiles)
+        active = {path_norm(w.user_data_dir) for w in wins}
+        if not active:
+            return list(self.profiles)
+        first = [p for p in self.profiles if p.normalized_dir() in active]
+        rest = [p for p in self.profiles if p.normalized_dir() not in active]
+        return first + rest
+
+    def _poll_loop(self) -> None:
+        # Startup already fetched once; wait a full interval before the next round.
+        self._stop.wait(self.poll_seconds)
+        while not self._stop.is_set():
+            for p in self._profiles_poll_order():
+                if self._stop.is_set():
+                    break
+                key, snap = self._poll_one(p)
+                self._publish(key, snap)
             self._stop.wait(self.poll_seconds)
 
     def _tick(self) -> None:

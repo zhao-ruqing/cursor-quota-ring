@@ -128,10 +128,15 @@ class _PROCESS_BASIC_INFORMATION(ctypes.Structure):
     ]
 
 
+DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ctypes.c_void_p(-4)
+
+
 def enable_dpi_awareness() -> None:
     try:
         # Per-monitor v2
-        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        )
     except Exception:
         try:
             ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -140,6 +145,14 @@ def enable_dpi_awareness() -> None:
                 user32.SetProcessDPIAware()
             except Exception:
                 pass
+
+
+def ensure_thread_dpi() -> None:
+    """Tk can switch the thread to 96-DPI mode; pin it back before measuring windows."""
+    try:
+        user32.SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+    except Exception:
+        pass
 
 
 def _process_image_name(pid: int) -> str:
@@ -323,6 +336,7 @@ def _is_main_cursor_window(title: str) -> bool:
 
 
 def discover_cursor_windows() -> list[CursorWindow]:
+    ensure_thread_dpi()
     _refresh_proc_cache()
     found: list[CursorWindow] = []
 
@@ -346,8 +360,19 @@ def discover_cursor_windows() -> list[CursorWindow]:
         user32.ClientToScreen(hwnd, ctypes.byref(pt))
 
         try:
-            dpi = int(user32.GetDpiForWindow(hwnd)) or 96
+            dpi = int(user32.GetDpiForWindow(hwnd) or 0)
         except Exception:
+            dpi = 0
+        if dpi < 96:
+            try:
+                mon = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+                dx = wt.UINT()
+                dy = wt.UINT()
+                ctypes.windll.shcore.GetDpiForMonitor(mon, 0, ctypes.byref(dx), ctypes.byref(dy))
+                dpi = int(dx.value or 0)
+            except Exception:
+                dpi = 0
+        if dpi < 96:
             dpi = 96
 
         found.append(

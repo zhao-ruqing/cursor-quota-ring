@@ -13,6 +13,7 @@ from .ring_draw import render_ring_photo
 from .usage_api import UsageSnapshot
 from .windows_track import (
     CursorWindow,
+    ensure_thread_dpi,
     foreground_hwnd,
     monitor_id,
     root_hwnd,
@@ -29,7 +30,9 @@ WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_NOACTIVATE = 0x08000000
 WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
-HWND_TOPMOST = -1
+# Must be a real HWND-sized value — bare -1 breaks SetWindowPos on 64-bit Python
+# (ERROR_INVALID_WINDOW_HANDLE / 1400), leaving the ring stuck at 0,0 without progress.
+HWND_TOPMOST = ctypes.c_void_p(-1)
 SWP_NOACTIVATE = 0x0010
 SWP_SHOWWINDOW = 0x0040
 SWP_HIDEWINDOW = 0x0080
@@ -37,6 +40,26 @@ SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOZORDER = 0x0004
 LWA_ALPHA = 0x00000002
+
+user32_raw.SetWindowPos.argtypes = [
+    ctypes.wintypes.HWND,
+    ctypes.c_void_p,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.wintypes.UINT,
+]
+user32_raw.SetWindowPos.restype = ctypes.wintypes.BOOL
+user32_raw.ShowWindow.argtypes = [ctypes.wintypes.HWND, ctypes.c_int]
+user32_raw.ShowWindow.restype = ctypes.wintypes.BOOL
+user32_raw.SetLayeredWindowAttributes.argtypes = [
+    ctypes.wintypes.HWND,
+    ctypes.wintypes.DWORD,
+    ctypes.wintypes.BYTE,
+    ctypes.wintypes.DWORD,
+]
+user32_raw.SetLayeredWindowAttributes.restype = ctypes.wintypes.BOOL
 
 
 def _norm_dir(path: str) -> str:
@@ -138,15 +161,22 @@ class RingOverlay:
         user32_raw.SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)
 
     def _set_pos(self, x: int, y: int, size: int) -> None:
-        """Move/show via Tk geometry first, then pin with Win32 (correct hwnd)."""
+        """Position with SetWindowPos. Avoid relying on Tk geometry for on-screen
+        pixels — Tk's scaling fights per-monitor DPI and can leave the ring
+        stuck off-screen or at 96-DPI size (looks like missing progress)."""
+        ensure_thread_dpi()
         try:
-            self.win.geometry(f"{size}x{size}+{x}+{y}")
             self.win.attributes("-topmost", True)
         except tk.TclError:
             pass
         if not self._mapped:
             try:
                 self.win.deiconify()
+            except tk.TclError:
+                pass
+            try:
+                # Size hint only; real pixel rect comes from SetWindowPos below.
+                self.win.geometry(f"{max(size, 36)}x{max(size, 36)}")
             except tk.TclError:
                 pass
         try:
@@ -157,17 +187,19 @@ class RingOverlay:
         hwnd = self._refresh_hwnd()
         self._apply_styles()
         flags = SWP_NOACTIVATE | SWP_SHOWWINDOW
+        targets: list[int] = []
         if hwnd:
-            user32_raw.SetWindowPos(hwnd, HWND_TOPMOST, x, y, size, size, flags)
-            user32_raw.ShowWindow(hwnd, 4)  # SW_SHOWNOACTIVATE
-            user32_raw.SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)
+            targets.append(hwnd)
         try:
             wid = int(self.win.winfo_id())
         except tk.TclError:
             wid = 0
-        if wid and wid != hwnd:
-            user32_raw.SetWindowPos(wid, HWND_TOPMOST, x, y, size, size, flags)
-            user32_raw.SetLayeredWindowAttributes(wid, 0, 255, LWA_ALPHA)
+        if wid and wid not in targets:
+            targets.append(wid)
+        for target in targets:
+            user32_raw.SetWindowPos(target, HWND_TOPMOST, int(x), int(y), int(size), int(size), flags)
+            user32_raw.ShowWindow(target, 4)  # SW_SHOWNOACTIVATE
+            user32_raw.SetLayeredWindowAttributes(target, 0, 255, LWA_ALPHA)
         self._mapped = True
 
     def hide(self) -> None:
@@ -194,16 +226,29 @@ class RingOverlay:
         self._pos = (x, y, size)
         self._set_pos(x, y, size)
 
-    def render(self, snap: UsageSnapshot | None, metric: str = "total") -> None:
+    def invalidate(self) -> None:
+        """Force next render() to rebuild the PhotoImage."""
+        self._last_pct = object()
+        self._last_size = -1
+
+    def render(self, snap: UsageSnapshot | None, metric: str = "total", *, force: bool = False) -> None:
         pct = snap.percent_for(metric) if snap and not snap.error else None
         err = bool(snap and snap.error)
-        if pct == self._last_pct and err == self._last_err and self.size == self._last_size:
+        if (
+            not force
+            and pct == self._last_pct
+            and err == self._last_err
+            and self.size == self._last_size
+        ):
             return
         self._last_pct = pct
         self._last_err = err
         self._last_size = self.size
         self._photo = render_ring_photo(self.size, pct, error=err)
         self.label.configure(image=self._photo)
+        # Keep a second ref on the widget — Tk can drop the image if only
+        # RingOverlay._photo holds it across withdraw/deiconify.
+        self.label.image = self._photo
 
 
 class OverlayManager:
@@ -238,6 +283,10 @@ class OverlayManager:
         self._peek = AccountPeekPopup(root)
         self._sticky_hwnds: list[int] = []
 
+    def invalidate_render_cache(self) -> None:
+        for ov in self._overlays.values():
+            ov.invalidate()
+
     @staticmethod
     def _is_our_ui(hwnd: int) -> bool:
         """Ring / peek / root Tk — clicking these must not count as leaving Cursor."""
@@ -257,7 +306,7 @@ class OverlayManager:
         fg_is_cursor: bool,
         fg_is_ours: bool,
     ) -> bool:
-        """Keep ring on Cursor across monitors; hide only when another app covers same screen."""
+        """Only show on Cursor — hide when another app has focus on that screen."""
         if self.foreground_only:
             return bool(fg) and root_hwnd(fg) == target.hwnd
 
@@ -266,7 +315,8 @@ class OverlayManager:
         if fg_is_cursor or fg_is_ours:
             return True
 
-        # Focus is a non-Cursor app: keep ring if that app is on another monitor.
+        # Other app focused: keep ring only if that app is on another monitor
+        # (Cursor still visible there). Same-monitor focus → hide.
         return monitor_id(fg) != monitor_id(target.hwnd)
 
     @staticmethod
@@ -383,6 +433,7 @@ class OverlayManager:
         return hash((w.client_left // 50, w.client_top // 50)) & 0x7FFFFFFF
 
     def _place(self, target: CursorWindow) -> tuple[int, int, int, str]:
+        ensure_thread_dpi()
         scale = target.dpi / 96.0
         size = max(36, int(round(self.overlay_size * scale)))
         bar_w = max(size + 4, int(round(self.activity_bar_width * scale)))
@@ -485,6 +536,7 @@ class OverlayManager:
         usage_by_dir: dict[str, UsageSnapshot],
         foreground_hwnd_cursor: int | None = None,
     ) -> None:
+        ensure_thread_dpi()
         self._usage_by_dir = usage_by_dir
         visible = [w for w in windows if w.visible_client]
         targets = self._targets(visible, foreground_hwnd_cursor)
@@ -507,14 +559,22 @@ class OverlayManager:
             key = _norm_dir(target.user_data_dir)
             raw = target.user_data_dir.replace("/", "\\").lower()
             snap = usage_by_dir.get(key) or usage_by_dir.get(raw)
+            if snap is None:
+                snap = self._lookup_snap(key) or self._lookup_snap(raw)
 
             ov.current_key = key
             ov.current_snap = snap
             ov.dpi_scale = target.dpi / 96.0
             # Render before mapping so first paint already has the ring image.
             ov.size = size
-            ov.render(snap, self.metric)
+            # Re-show after withdraw must force redraw — cached PhotoImage can
+            # be blank even when pct matches the last (hidden) render.
+            force = not ov._mapped
+            ov.render(snap, self.metric, force=force)
             ov.show_at(x, y, size, mode=mode)
+            if snap is not None and not snap.error and snap.percent_for(self.metric) is not None:
+                # Ensure progress is painted after the window is mapped.
+                ov.render(snap, self.metric, force=True)
             active.add(mon)
 
         for mon in list(self._overlays.keys()):
